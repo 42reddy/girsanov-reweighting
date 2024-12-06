@@ -1,59 +1,37 @@
-from KineticsSandbox.potential.D1 import DoubleWell
-from KineticsSandbox.potential.D1 import TripleWell
-from KineticsSandbox.system import system
+from scipy import constants
 from KineticsSandbox.integrator import D1_stochastic
 import numpy as np
-import matplotlib.pyplot as plt
-import scipy.constants as const
-from KineticsSandbox.potential import D1
 
-
-l = 5   # length of the simulation box
-n = 1   # number of particles
-m = 1   # mass
-T = 1  # temperature
-kb = 1
-N = int(1e7)  # num of iterations
-x = 1.2         # initial positions
-v = np.random.normal(0, np.sqrt(kb*T),n)    # initial velocities
-dt = 0.01      # time step
-h = 0.01
-xi = 1    # friction coefficient
-
-
-system = system.D1(m,x,v,T,xi,dt,h)       # initialize the system
-
-
-param = [1,0,1]          # parameters for the double well potential
-double_well = DoubleWell(param)      # initial class doublewell
-triple_well = TripleWell([4])
-potential = double_well.potential(np.linspace(-2,2,200))
-
+kb = 0.001 * constants.R
 
 class reweight():
 
-    def __init__(self, n_states, tau, V_simulation, V_target):
+    def __init__(self, system, n_states, tau, V_simulation, V_target):
 
+        self.system = system
         self.n_states = n_states
         self.tau = tau
         self.V_simulation = V_simulation
         self.V_target = V_target
 
-    def generate(self):
+    def generate(self, N):
 
         """
         simulates the system at double well potential and Euler Maruyama scheme
         """
         eta = np.zeros(N)
+        delta_eta = np.zeros(N)
         X = np.zeros(N)
-        X[0] = system.x
+        X[0] = self.system.x
         for i in range(N - 1):
             eta[i] = np.random.normal(0, 1)  # random number corresponding to random force
-
-            D1_stochastic.EM(system, self.V_simulation, eta_k=eta[i])
+            delta_eta[i] = (np.sqrt(self.system.dt / (2 * kb * self.system.T * self.system.xi * self.system.m)) *
+                            self.gradient(self.system.x)[0])
+            D1_stochastic.EM(self.system, self.V_simulation, eta_k=eta[i])
             # update the system position
-            X[i + 1] = system.x
-        return X, eta
+            X[i + 1] = self.system.x
+
+        return X, eta, delta_eta
 
     def MSM(self, X, lag_time):
 
@@ -63,8 +41,8 @@ class reweight():
         :return: Transition matrix
 
         """
-
-        bins = np.linspace(min(X) + 0.05 , max(X) - 0.05  , self.n_states - 1)
+        lag_time = int(lag_time)
+        bins = np.linspace(-2, 2, self.n_states - 1)
         discretized_path = np.digitize(X, bins)
 
         """
@@ -80,7 +58,7 @@ class reweight():
 
         transition_matrix = count_matrix / np.sum(count_matrix, axis= 1, keepdims=True)
 
-        return transition_matrix, discretized_path
+        return transition_matrix
 
     def equilibrium_dist(self, transition_matrix):
 
@@ -105,41 +83,32 @@ class reweight():
                          self.V_target.potential(x) - self.V_simulation.potential(x)],
                         dtype=object)
 
-    def reweighting_factor(self, X):
+    def reweighting_factor(self, X, eta, delta_eta):
 
         """
-
+        :param eta: random number at simulation potential
+        :param delta_eta: random number at target potential
         :param X: simulation path
-        :param V_sim: simulation potential
-        :param V_target: target potential
         :return: reweighting factors for each path
         """
 
-
-
-        """ generate several paths using a sliding window method """
-
-        paths = []
-        for i in range(int((len(X) - self.tau))):
-            paths.append(X[i : (i+1) + self.tau ])
+        len_paths = int((len(X) - self.tau))  # length of the paths generated from sliding window method
 
         """ calculate the reweighting factor for each observed path """
-        M = np.zeros(len(paths))
-        for i in range(len(paths)):
-            eta = np.zeros(3)
-            delta_eta = np.zeros_like(eta)
-            for j in range(3):
+        M = np.zeros(len_paths)
+        for i in range(len_paths):
+            """calculate eta and delta_eta for each path"""
+            eta_ = eta[i : i + self.tau]
+            delta_eta_ = delta_eta[i : i + self.tau]
 
-                eta[j] = ((paths[i][j + 1] - paths[i][j] - self.V_simulation.force_ana(paths[i][j])[0] * system.dt / system.xi_m) *(np.sqrt(m/(2*kb*T*dt))))
+            """calculate the reweighting factor"""
 
-                #calculates delta eta from the gradient of bias potential
-                delta_eta[j] = (double_well.force_ana(paths[i][j]) - triple_well.force_ana(paths[i][j])) * np.sqrt(dt/(2*kb*T*system.m))
+            M[i] = np.exp((self.V_simulation.potential(X[i]) - self.V_target.potential(
+                    X[i])) / (kb * self.system.T)) * (np.exp(-np.sum(eta_ * delta_eta_)) * np.exp(-0.5 * np.sum(delta_eta_ ** 2)))
 
-            M[i] = np.exp((self.V_simulation.potential(paths[i][0]) - self.V_target.potential(paths[i][0]))/T) * (np.exp(-np.sum(eta*delta_eta)) * np.exp(-0.5 * np.sum(delta_eta**2)))
+        return M
 
-        return M, paths
-
-    def reweighted_MSM(self, X, paths, M):
+    def reweighted_MSM(self, X, M, lag_time):
 
         """
         :param X: simulated path
@@ -149,16 +118,17 @@ class reweight():
         :return: reweighted transition matrix
         """
 
-        tol = 0.2
-        bins = np.linspace(min(X) + tol, max(X) - tol, self.n_states - 1)
-        for i in range(len(paths)):
-            paths[i] = np.digitize(paths[i], bins)
-
+        bins = np.linspace(-2, 2, self.n_states - 1)
+        len_paths = int(len(X) - self.tau)
         count_matrix = np.zeros((self.n_states, self.n_states))
 
-        for i in range(len(paths)):
-            for j in range(len(paths[i]) - 1):
-                count_matrix[paths[i][j], paths[i][j+1]] += 1 * M[i]
+        discretized_path = np.digitize(X, bins)
+
+        for i in range(len_paths):
+            path = discretized_path[i : i + self.tau+1]
+
+            for j in range(int(self.tau - lag_time)):
+                count_matrix[path[j], path[j + lag_time]] += 1 * M[i]
 
         count_matrix = 0.5 * (count_matrix + np.transpose(count_matrix))
 
